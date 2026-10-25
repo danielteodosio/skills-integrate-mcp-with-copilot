@@ -5,11 +5,19 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+import hashlib
+import hmac
+import json
+import secrets
+import time
+from pathlib import Path
+
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
-from pathlib import Path
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -77,6 +85,53 @@ activities = {
     }
 }
 
+TEACHERS_FILE = Path(__file__).with_name("teachers.json")
+PASSWORD_HASH_ITERATIONS = 310_000
+SESSION_DURATION_SECONDS = 8 * 60 * 60
+teacher_sessions: dict[str, tuple[str, float]] = {}
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def get_current_teacher(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+) -> str:
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Teacher login required")
+
+    session = teacher_sessions.get(credentials.credentials)
+    if session is None or session[1] <= time.time():
+        teacher_sessions.pop(credentials.credentials, None)
+        raise HTTPException(status_code=401, detail="Teacher session expired")
+
+    return session[0]
+
+
+def _load_teachers() -> list[dict[str, str]]:
+    if not TEACHERS_FILE.exists():
+        return []
+
+    with TEACHERS_FILE.open(encoding="utf-8") as teachers_file:
+        data = json.load(teachers_file)
+    return data.get("teachers", [])
+
+
+def _verify_password(password: str, salt_hex: str, password_hash: str) -> bool:
+    try:
+        salt = bytes.fromhex(salt_hex)
+        expected_hash = bytes.fromhex(password_hash)
+    except ValueError:
+        return False
+
+    actual_hash = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, PASSWORD_HASH_ITERATIONS
+    )
+    return hmac.compare_digest(actual_hash, expected_hash)
+
 
 @app.get("/")
 def root():
@@ -88,8 +143,37 @@ def get_activities():
     return activities
 
 
+@app.post("/auth/login")
+def login(credentials: LoginRequest):
+    for teacher in _load_teachers():
+        if hmac.compare_digest(teacher["username"], credentials.username):
+            if _verify_password(
+                credentials.password, teacher["salt"], teacher["password_hash"]
+            ):
+                token = secrets.token_urlsafe(32)
+                teacher_sessions[token] = (
+                    teacher["username"], time.time() + SESSION_DURATION_SECONDS
+                )
+                return {"access_token": token, "token_type": "bearer"}
+            break
+
+    raise HTTPException(status_code=401, detail="Invalid username or password")
+
+
+@app.post("/auth/logout")
+def logout(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    _teacher: str = Depends(get_current_teacher),
+):
+    if credentials is not None:
+        teacher_sessions.pop(credentials.credentials, None)
+    return {"message": "Logged out"}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str, email: str, _teacher: str = Depends(get_current_teacher)
+):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -111,7 +195,9 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str, email: str, _teacher: str = Depends(get_current_teacher)
+):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
